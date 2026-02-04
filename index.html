@@ -1,0 +1,632 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Dashboard de Prompts</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="container">
+  <header class="topbar">
+    <div class="title">
+      <h1>Dashboard de Prompts</h1>
+    </div>
+
+    <div class="toolbar">
+      <input id="search" placeholder="Buscar...">
+      <button class="btn primary" id="openModal">+ Adicionar</button>
+    </div>
+
+  <!-- TABS -->
+  <div class="tabs">
+    <button class="tab active" data-tab="general">Prompts (Gerais)</button>
+    <button class="tab" data-tab="utility">Prompts Utilitários</button>
+  </div>
+  </header>
+  <section class="grid" id="grid"></section>
+</div>
+
+<div class="toast" id="toast">Copiado!</div>
+
+<!-- MODAL: GENERAL -->
+<dialog id="modalGeneral">
+  <div class="modal-head">
+    <h2>Novo Prompt (Geral)</h2>
+    <button class="btn" data-close="modalGeneral">Fechar</button>
+  </div>
+
+  <div class="modal-body">
+    <input id="newTitleGeneral" placeholder="Título">
+    <input type="file" id="imageInputGeneral" accept="image/*">
+
+    <div class="crop-area">
+      <canvas id="cropCanvasGeneral" width="320" height="320"></canvas>
+      <div class="crop-overlay"><div class="crop-frame"></div></div>
+    </div>
+
+    <div class="zoom-row">
+      <span class="zoom-label">Zoom</span>
+      <input id="zoomGeneral" type="range" min="1" max="3" step="0.01" value="1">
+      <button class="btn" id="resetCropGeneral">Reset</button>
+    </div>
+
+    <textarea id="newPromptGeneral" placeholder="Cole o prompt aqui"></textarea>
+  </div>
+
+  <div class="modal-foot">
+    <button class="btn" data-close="modalGeneral">Cancelar</button>
+    <button class="btn primary" id="addGeneral">Salvar</button>
+  </div>
+</dialog>
+
+<!-- MODAL: UTILITY (também com imagem + crop) -->
+<dialog id="modalUtility">
+  <div class="modal-head">
+    <h2>Novo Prompt (Utilitário)</h2>
+    <button class="btn" data-close="modalUtility">Fechar</button>
+  </div>
+
+  <div class="modal-body">
+    <input id="newTitleUtility" placeholder="Título (ex: “Recolorir azul → #380411”)">
+    <input type="file" id="imageInputUtility" accept="image/*">
+
+    <div class="crop-area">
+      <canvas id="cropCanvasUtility" width="320" height="320"></canvas>
+      <div class="crop-overlay"><div class="crop-frame"></div></div>
+    </div>
+
+    <div class="zoom-row">
+      <span class="zoom-label">Zoom</span>
+      <input id="zoomUtility" type="range" min="1" max="3" step="0.01" value="1">
+      <button class="btn" id="resetCropUtility">Reset</button>
+    </div>
+
+    <textarea id="newPromptUtility" placeholder="Cole o prompt utilitário aqui"></textarea>
+  </div>
+
+  <div class="modal-foot">
+    <button class="btn" data-close="modalUtility">Cancelar</button>
+    <button class="btn primary" id="addUtility">Salvar</button>
+  </div>
+</dialog>
+
+<script>
+/* =========================
+   INDEXEDDB (DB_VERSION = 1)
+========================= */
+const DB_NAME = "prompt_dashboard_db";
+const DB_VERSION = 1;
+const STORE = "items";
+
+function openDB(){
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(STORE)) {
+        const store = db.createObjectStore(STORE, { keyPath: "id" });
+        store.createIndex("createdAt", "createdAt");
+        store.createIndex("type", "type");
+        store.createIndex("title", "title");
+      }
+    };
+
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function dbPut(item){
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, "readwrite");
+    tx.objectStore(STORE).put(item);
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function dbGetAll(){
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, "readonly");
+    const req = tx.objectStore(STORE).getAll();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function dbDelete(id){
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, "readwrite");
+    tx.objectStore(STORE).delete(id);
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+/* =========================
+   UI / STATE
+========================= */
+const grid = document.getElementById("grid");
+const search = document.getElementById("search");
+const toast = document.getElementById("toast");
+
+const modalGeneral = document.getElementById("modalGeneral");
+const modalUtility = document.getElementById("modalUtility");
+
+let allItems = [];
+let currentTab = "general";
+const blobUrlMap = new Map();
+
+function showToast(msg="Copiado!"){
+  toast.textContent = msg;
+  toast.classList.add("show");
+  setTimeout(() => toast.classList.remove("show"), 1200);
+}
+
+function escapeHtml(str){
+  return (str || "")
+    .replaceAll("&","&amp;")
+    .replaceAll("<","&lt;")
+    .replaceAll(">","&gt;")
+    .replaceAll('"',"&quot;")
+    .replaceAll("'","&#039;");
+}
+
+function ensureBlobUrl(item){
+  if (!item.imageBlob) return "";
+  if (blobUrlMap.has(item.id)) return blobUrlMap.get(item.id);
+  const url = URL.createObjectURL(item.imageBlob);
+  blobUrlMap.set(item.id, url);
+  return url;
+}
+
+function cleanupBlobUrl(id){
+  const url = blobUrlMap.get(id);
+  if (url){
+    URL.revokeObjectURL(url);
+    blobUrlMap.delete(id);
+  }
+}
+
+function getVisibleItems(){
+  const q = search.value.toLowerCase().trim();
+  let list = allItems.filter(i => (i.type || "general") === currentTab);
+
+  if (q){
+    list = list.filter(i =>
+      (i.title || "").toLowerCase().includes(q) ||
+      (i.prompt || "").toLowerCase().includes(q)
+    );
+  }
+
+  list.sort((a,b) => (b.createdAt || 0) - (a.createdAt || 0));
+  return list;
+}
+
+function render(){
+  const list = getVisibleItems();
+
+  grid.innerHTML = list.map(item => {
+  const imgUrl = ensureBlobUrl(item);
+
+  return `
+    <div class="card">
+      <img src="${imgUrl}" alt="">
+
+      ${item.title && item.title.trim() ? `
+        <div class="prompt-title">
+          ${escapeHtml(item.title)}
+        </div>
+      ` : ``}
+
+      <pre>${escapeHtml(item.prompt)}</pre>
+
+      <div class="row-actions">
+        <button class="btn primary" data-action="copy" data-id="${item.id}">
+          Copiar Prompt
+        </button>
+        <button class="btn" data-action="remove" data-id="${item.id}" title="Remover">
+          🗑️
+        </button>
+      </div>
+    </div>
+  `;
+}).join("");
+
+
+}
+
+grid.addEventListener("click", async (e) => {
+  const btn = e.target.closest("button");
+  if (!btn) return;
+
+  const id = btn.dataset.id;
+  const action = btn.dataset.action;
+  const item = allItems.find(i => i.id === id);
+  if (!item) return;
+
+  if (action === "copy"){
+    await navigator.clipboard.writeText(item.prompt);
+    showToast("Copiado!");
+  }
+
+  if (action === "remove"){
+    await dbDelete(id);
+    cleanupBlobUrl(id);
+    allItems = allItems.filter(i => i.id !== id);
+    render();
+    showToast("Removido!");
+  }
+});
+
+search.addEventListener("input", render);
+
+/* =========================
+   TABS
+========================= */
+document.querySelectorAll(".tab").forEach(tab => {
+  tab.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+    tab.classList.add("active");
+    currentTab = tab.dataset.tab;
+    render();
+  });
+});
+
+/* =========================
+   MODAIS
+========================= */
+document.getElementById("openModal").addEventListener("click", () => {
+  if (currentTab === "general") modalGeneral.showModal();
+  else modalUtility.showModal();
+});
+
+document.querySelectorAll("[data-close]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.getElementById(btn.dataset.close).close();
+  });
+});
+
+/* =========================
+   CROP ENGINE (reutilizável)
+   - arrastar + zoom slider + scroll
+========================= */
+function createCropper({ canvasId, fileInputId, zoomId, resetId }){
+  const canvas = document.getElementById(canvasId);
+  const ctx = canvas.getContext("2d");
+  const fileInput = document.getElementById(fileInputId);
+  const zoomEl = document.getElementById(zoomId);
+  const resetBtn = document.getElementById(resetId);
+
+  let img = null;
+  let scale = 1, minScale = 1, offsetX = 0, offsetY = 0;
+  let dragging = false, lastX = 0, lastY = 0;
+
+  const clamp = (v,min,max) => Math.max(min, Math.min(max, v));
+
+  function drawPlaceholder(){
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    ctx.fillStyle = "rgba(255,255,255,0.06)";
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.fillStyle = "rgba(255,255,255,0.55)";
+    ctx.font = "14px system-ui";
+    ctx.textAlign = "center";
+    ctx.fillText("Envie uma imagem para recortar", canvas.width/2, canvas.height/2);
+  }
+
+  function fit(){
+    if (!img) return;
+    const cw = canvas.width, ch = canvas.height;
+    const sX = cw / img.width;
+    const sY = ch / img.height;
+
+    minScale = Math.max(sX, sY);
+    scale = minScale;
+    zoomEl.value = 1;
+
+    const drawW = img.width * scale;
+    const drawH = img.height * scale;
+    offsetX = (cw - drawW) / 2;
+    offsetY = (ch - drawH) / 2;
+    draw();
+  }
+
+  function bound(){
+    if (!img) return;
+    const cw = canvas.width, ch = canvas.height;
+    const drawW = img.width * scale;
+    const drawH = img.height * scale;
+    offsetX = clamp(offsetX, cw - drawW, 0);
+    offsetY = clamp(offsetY, ch - drawH, 0);
+  }
+
+  function draw(){
+    if (!img) return drawPlaceholder();
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    bound();
+    ctx.drawImage(img, offsetX, offsetY, img.width*scale, img.height*scale);
+  }
+
+  function getScaled(){
+    return minScale * parseFloat(zoomEl.value);
+  }
+
+  fileInput.addEventListener("change", (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      const newImg = new Image();
+      newImg.onload = () => {
+        img = newImg;
+        fit();
+      };
+      newImg.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+
+  zoomEl.addEventListener("input", () => {
+    if (!img) return;
+
+    const cx = canvas.width/2, cy = canvas.height/2;
+    const prev = scale;
+    const next = getScaled();
+
+    const worldX = (cx - offsetX) / prev;
+    const worldY = (cy - offsetY) / prev;
+
+    scale = next;
+    offsetX = cx - worldX * scale;
+    offsetY = cy - worldY * scale;
+
+    draw();
+  });
+
+  canvas.addEventListener("wheel", (e) => {
+    if (!img) return;
+    e.preventDefault();
+
+    const step = 0.06;
+    let z = parseFloat(zoomEl.value);
+    z += (e.deltaY < 0) ? step : -step;
+    z = clamp(z, parseFloat(zoomEl.min), parseFloat(zoomEl.max));
+    zoomEl.value = z;
+    zoomEl.dispatchEvent(new Event("input"));
+  }, { passive:false });
+
+  canvas.addEventListener("mousedown", (e) => {
+    if (!img) return;
+    dragging = true;
+    lastX = e.clientX;
+    lastY = e.clientY;
+  });
+  window.addEventListener("mouseup", () => dragging = false);
+  window.addEventListener("mousemove", (e) => {
+    if (!dragging || !img) return;
+    offsetX += (e.clientX - lastX);
+    offsetY += (e.clientY - lastY);
+    lastX = e.clientX;
+    lastY = e.clientY;
+    draw();
+  });
+
+  canvas.addEventListener("touchstart", (e) => {
+    if (!img) return;
+    dragging = true;
+    lastX = e.touches[0].clientX;
+    lastY = e.touches[0].clientY;
+  }, {passive:true});
+
+  canvas.addEventListener("touchmove", (e) => {
+    if (!dragging || !img) return;
+    const x = e.touches[0].clientX;
+    const y = e.touches[0].clientY;
+    offsetX += (x - lastX);
+    offsetY += (y - lastY);
+    lastX = x;
+    lastY = y;
+    draw();
+  }, {passive:true});
+
+  canvas.addEventListener("touchend", () => dragging = false);
+
+  resetBtn.addEventListener("click", fit);
+
+  async function exportBlob(){
+    return new Promise((resolve) => {
+      canvas.toBlob((blob) => resolve(blob), "image/jpeg", 0.85);
+    });
+  }
+
+  function clear(){
+    fileInput.value = "";
+    img = null;
+    drawPlaceholder();
+  }
+
+  function hasImage(){ return !!img; }
+
+  drawPlaceholder();
+  return { exportBlob, clear, hasImage };
+}
+
+/* =========================
+   DOIS CROPPERS
+========================= */
+const cropGeneral = createCropper({
+  canvasId: "cropCanvasGeneral",
+  fileInputId: "imageInputGeneral",
+  zoomId: "zoomGeneral",
+  resetId: "resetCropGeneral"
+});
+
+const cropUtility = createCropper({
+  canvasId: "cropCanvasUtility",
+  fileInputId: "imageInputUtility",
+  zoomId: "zoomUtility",
+  resetId: "resetCropUtility"
+});
+
+/* =========================
+   SALVAR: GENERAL
+========================= */
+document.getElementById("addGeneral").addEventListener("click", async () => {
+  const title = document.getElementById("newTitleGeneral").value.trim() || "Sem título";
+  const prompt = document.getElementById("newPromptGeneral").value.trim();
+
+  if (!cropGeneral.hasImage()) return alert("Faça upload da imagem antes.");
+  if (!prompt) return alert("Cole o prompt antes.");
+
+  const imageBlob = await cropGeneral.exportBlob();
+  const newItem = {
+    id: crypto.randomUUID(),
+    type: "general",
+    title,
+    prompt,
+    createdAt: Date.now(),
+    imageBlob
+  };
+
+  await dbPut(newItem);
+  allItems.unshift(newItem);
+  modalGeneral.close();
+
+  document.getElementById("newTitleGeneral").value = "";
+  document.getElementById("newPromptGeneral").value = "";
+  cropGeneral.clear();
+
+  render();
+  showToast("Salvo!");
+});
+
+/* =========================
+   SALVAR: UTILITY (COM IMAGEM)
+========================= */
+document.getElementById("addUtility").addEventListener("click", async () => {
+  const title = document.getElementById("newTitleUtility").value.trim() || "Sem título";
+  const prompt = document.getElementById("newPromptUtility").value.trim();
+
+  if (!cropUtility.hasImage()) return alert("Faça upload da imagem antes.");
+  if (!prompt) return alert("Cole o prompt antes.");
+
+  const imageBlob = await cropUtility.exportBlob();
+  const newItem = {
+    id: crypto.randomUUID(),
+    type: "utility",
+    title,
+    prompt,
+    createdAt: Date.now(),
+    imageBlob
+  };
+
+  await dbPut(newItem);
+  allItems.unshift(newItem);
+  modalUtility.close();
+
+  document.getElementById("newTitleUtility").value = "";
+  document.getElementById("newPromptUtility").value = "";
+  cropUtility.clear();
+
+  render();
+  showToast("Salvo!");
+});
+
+// ===== MIGRAÇÃO (localStorage -> IndexedDB) =====
+// 1) Ajuste aqui a chave do seu HTML antigo:
+const OLD_STORAGE_KEY = "dashboard_prompts_v3";
+
+// 2) Evita migrar duas vezes
+const MIGRATION_FLAG = "migrated_to_indexeddb_v1";
+
+async function migrateFromLocalStorageIfNeeded() {
+  if (localStorage.getItem(MIGRATION_FLAG) === "true") return;
+
+  const raw = localStorage.getItem(OLD_STORAGE_KEY);
+  if (!raw) {
+    localStorage.setItem(MIGRATION_FLAG, "true");
+    return;
+  }
+
+  let oldItems = [];
+  try {
+    oldItems = JSON.parse(raw) || [];
+  } catch (e) {
+    console.warn("Falha ao ler localStorage antigo:", e);
+    localStorage.setItem(MIGRATION_FLAG, "true");
+    return;
+  }
+
+  if (!Array.isArray(oldItems) || oldItems.length === 0) {
+    localStorage.setItem(MIGRATION_FLAG, "true");
+    return;
+  }
+
+  // Helper: converte dataURL/base64 -> Blob
+  async function dataURLToBlob(dataURL) {
+    const res = await fetch(dataURL);
+    return await res.blob();
+  }
+
+  let migratedCount = 0;
+
+  for (const it of oldItems) {
+    // Antigos normalmente tinham: id, title, image (base64), prompt
+    const id = it.id || crypto.randomUUID();
+    const title = it.title || "Sem título";
+    const prompt = it.prompt || "";
+    const createdAt = Date.now();
+
+    // Se a imagem for base64/dataURL, converte p/ blob
+    let imageBlob = null;
+
+    if (it.image && typeof it.image === "string" && it.image.startsWith("data:image/")) {
+      try {
+        imageBlob = await dataURLToBlob(it.image);
+      } catch (e) {
+        console.warn("Falha ao converter imagem:", e);
+      }
+    }
+
+    // Define o tipo default como general
+    const newItem = {
+      id,
+      type: "general",
+      title,
+      prompt,
+      createdAt,
+      imageBlob
+    };
+
+    // Só migra se tiver prompt (evita lixo)
+    if (prompt.trim()) {
+      await dbPut(newItem);
+      migratedCount++;
+    }
+  }
+
+  localStorage.setItem(MIGRATION_FLAG, "true");
+  console.log(`Migração concluída: ${migratedCount} itens migrados.`);
+}
+
+
+/* =========================
+   BOOT
+========================= */
+(async function init(){
+  await migrateFromLocalStorageIfNeeded();
+  allItems = await dbGetAll();
+  allItems = allItems.map(i => ({ ...i, type: i.type || "general" }));
+  render();
+})();
+</script>
+
+</body>
+</html>
