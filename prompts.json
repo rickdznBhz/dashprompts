@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "items": [
+    {
+      "id": "util-001",
+      "type": "utility",
+      "title": "Preserve + Enhance",
+      "prompt": "Preserve the original image exactly as it is and only enhance its quality...",
+      "imageUrl": "assets/util-001.jpg"
+    }
+  ]
+}
