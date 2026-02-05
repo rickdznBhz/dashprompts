@@ -17,6 +17,9 @@
     <div class="toolbar">
       <input id="search" placeholder="Buscar...">
       <button class="btn primary" id="openModal">+ Adicionar</button>
+      <button class="btn" id="exportBtn">Exportar</button>
+      <input id="importFile" type="file" accept="application/json" hidden>
+      <button class="btn" id="importBtn">Importar</button>
     </div>
 
   <!-- TABS -->
@@ -630,3 +633,4 @@ async function migrateFromLocalStorageIfNeeded() {
 
 </body>
 </html>
+
