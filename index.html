@@ -152,6 +152,199 @@ async function dbDelete(id){
   });
 }
 
+
+  document.getElementById("exportBtn").addEventListener("click", async () => {
+  await exportPromptsToJsonFile();
+});
+
+document.getElementById("importBtn").addEventListener("click", () => {
+  document.getElementById("importFile").click();
+});
+
+document.getElementById("importFile").addEventListener("change", async (e) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  await importPromptsFromJsonFile(file);
+
+  // Recarrega a lista na tela:
+  allItems = await dbGetAll();
+  allItems = allItems.map(i => ({ ...i, type: i.type || "general" }));
+  render();
+
+  e.target.value = "";
+});
+// ====== PROMPTS.JSON (repo) + IMPORT/EXPORT ======
+const REPO_PROMPTS_URL = "prompts.json";
+const MIGRATION_FLAG_REPO = "repo_prompts_imported_v1";
+
+// Converte URL -> Blob (pra salvar no IndexedDB e ficar offline também)
+async function urlToBlob(url) {
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error("Falha ao baixar imagem: " + url);
+  return await res.blob();
+}
+
+// Converte dataURL(base64) -> Blob
+async function dataUrlToBlob(dataUrl) {
+  const res = await fetch(dataUrl);
+  return await res.blob();
+}
+
+// Converte Blob -> dataURL (para export)
+function blobToDataURL(blob) {
+  return new Promise((resolve) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.readAsDataURL(blob);
+  });
+}
+
+// Importa prompts.json do repo para o IndexedDB (1x por navegador)
+async function importRepoPromptsOnce() {
+  if (localStorage.getItem(MIGRATION_FLAG_REPO) === "true") return;
+
+  let payload;
+  try {
+    const res = await fetch(REPO_PROMPTS_URL, { cache: "no-store" });
+    if (!res.ok) {
+      localStorage.setItem(MIGRATION_FLAG_REPO, "true");
+      return;
+    }
+    payload = await res.json();
+  } catch (e) {
+    // Se falhar (offline), não trava o app.
+    return;
+  }
+
+  const repoItems = payload?.items || [];
+  if (!Array.isArray(repoItems) || repoItems.length === 0) {
+    localStorage.setItem(MIGRATION_FLAG_REPO, "true");
+    return;
+  }
+
+  // Para evitar duplicar, buscamos os IDs que já existem
+  const existing = await dbGetAll();
+  const existingIds = new Set(existing.map(i => i.id));
+
+  for (const it of repoItems) {
+    if (!it || !it.prompt) continue;
+
+    const id = it.id || crypto.randomUUID();
+    if (existingIds.has(id)) continue;
+
+    const type = it.type === "utility" ? "utility" : "general";
+    const title = it.title || "";
+    const prompt = it.prompt || "";
+    const createdAt = it.createdAt || Date.now();
+
+    let imageBlob = null;
+
+    // 1) Preferência: imageUrl (assets do repo)
+    if (it.imageUrl) {
+      try {
+        imageBlob = await urlToBlob(it.imageUrl);
+      } catch {}
+    }
+
+    // 2) Alternativa: base64 dentro do JSON
+    if (!imageBlob && it.imageDataUrl && it.imageDataUrl.startsWith("data:image/")) {
+      try {
+        imageBlob = await dataUrlToBlob(it.imageDataUrl);
+      } catch {}
+    }
+
+    // Se você quiser permitir utilitário sem imagem, remova esse "if"
+    if (!imageBlob) continue;
+
+    await dbPut({
+      id,
+      type,
+      title,
+      prompt,
+      createdAt,
+      imageBlob,
+      source: "repo"
+    });
+  }
+
+  localStorage.setItem(MIGRATION_FLAG_REPO, "true");
+}
+
+// Exporta tudo do IndexedDB para um arquivo JSON
+async function exportPromptsToJsonFile() {
+  const all = await dbGetAll();
+
+  const items = [];
+  for (const it of all) {
+    const imageDataUrl = it.imageBlob ? await blobToDataURL(it.imageBlob) : null;
+
+    items.push({
+      id: it.id,
+      type: it.type || "general",
+      title: it.title || "",
+      prompt: it.prompt || "",
+      createdAt: it.createdAt || Date.now(),
+      // Export com base64 (auto contido). Depois você pode trocar por imageUrl manualmente no repo.
+      imageDataUrl
+    });
+  }
+
+  const payload = {
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    items
+  };
+
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "prompts-export.json";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+
+  URL.revokeObjectURL(url);
+}
+
+// Importa um JSON (prompts-export.json) e grava no IndexedDB
+async function importPromptsFromJsonFile(file) {
+  const text = await file.text();
+  const payload = JSON.parse(text);
+  const list = payload?.items || [];
+
+  if (!Array.isArray(list) || list.length === 0) return;
+
+  const existing = await dbGetAll();
+  const existingIds = new Set(existing.map(i => i.id));
+
+  for (const it of list) {
+    if (!it || !it.prompt) continue;
+
+    const id = it.id || crypto.randomUUID();
+    if (existingIds.has(id)) continue;
+
+    const type = it.type === "utility" ? "utility" : "general";
+    const title = it.title || "";
+    const prompt = it.prompt || "";
+    const createdAt = it.createdAt || Date.now();
+
+    let imageBlob = null;
+
+    if (it.imageDataUrl && it.imageDataUrl.startsWith("data:image/")) {
+      imageBlob = await dataUrlToBlob(it.imageDataUrl);
+    } else if (it.imageUrl) {
+      // caso tenha vindo com URL
+      try { imageBlob = await urlToBlob(it.imageUrl); } catch {}
+    }
+
+    if (!imageBlob) continue;
+
+    await dbPut({ id, type, title, prompt, createdAt, imageBlob, source: "import" });
+  }
+}
+
 /* =========================
    UI / STATE
 ========================= */
@@ -624,11 +817,12 @@ async function migrateFromLocalStorageIfNeeded() {
    BOOT
 ========================= */
 (async function init(){
-  await migrateFromLocalStorageIfNeeded();
-  allItems = await dbGetAll();
+  await importRepoPromptsOnce();     // <-- lê do prompts.json
+  allItems = await dbGetAll();       // <-- carrega do IndexedDB
   allItems = allItems.map(i => ({ ...i, type: i.type || "general" }));
   render();
 })();
+
 </script>
 
 </body>
